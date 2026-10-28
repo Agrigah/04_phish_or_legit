@@ -1,0 +1,2 @@
+time,text,score,threshold,model,predicted,suggested_label
+2026-10-28T12:18:37,"Hello, We noticed activity on your Northbank account. Confirm your details. Please reply as soon as you can. https://xcen0-login.info/at5g",0.917,0.5,Logistic regression,phish,legit

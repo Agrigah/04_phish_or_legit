@@ -1,10 +1,15 @@
-"""Lab 04 - Phish or Legit? (Streamlit UI, animated theme). Run:  streamlit run app.py"""
-import html
-import re
+"""Lab 04 - Phish or Legit? (Streamlit UI + extensions). Run:  streamlit run app.py"""
+import csv, html, io, os, re
+from datetime import datetime
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
+from sklearn.calibration import calibration_curve
+from sklearn.metrics import brier_score_loss, confusion_matrix, precision_recall_fscore_support
 
 from src.pipeline import load_data, split, make_pipeline, predict, word_weights, contributions
 
@@ -66,8 +71,8 @@ div.stButton > button:hover { transform:translateY(-3px) scale(1.03); box-shadow
 section[data-testid="stSidebar"] { border-right:1px solid rgba(255,255,255,.08); }
 </style>
 """
-st.markdown(CSS, unsafe_allow_html=True)
 
+st.markdown(CSS, unsafe_allow_html=True)
 st.markdown('<div class="hero"><div class="icon">🎣</div><h1>Phish or Legit?</h1></div>', unsafe_allow_html=True)
 st.markdown('<div class="notice">⚠️ This tool supports a human decision and does not block messages by itself. '
             'The data is synthetic.</div>', unsafe_allow_html=True)
@@ -81,102 +86,173 @@ EXAMPLES = {
     "Phishing - correctly detected (BlueFreight)":
         "ALERT: BlueFreight: your package is waiting. Confirm your details. "
         "This is your final notice. http://secure-2kcy-verify.com/j8n1ws",
-    "Legit - correctly classified (order)":
-        "Your order #96192 has shipped.",
-    "Legit - correctly classified (reminder)":
-        "Reminder: class starts tomorrow at 9. Open the official app to view it.",
-    "MISSED phishing (false negative)":
-        "Your Civic Savings account has a new notice. http://bit.ly/tp99jp",
+    "Legit - correctly classified (order)": "Your order #96192 has shipped.",
+    "Legit - correctly classified (reminder)": "Reminder: class starts tomorrow at 9. Open the official app to view it.",
+    "MISSED phishing (false negative)": "Your Civic Savings account has a new notice. http://bit.ly/tp99jp",
     "FALSE ALARM on legit (false positive)":
         "Your invoice of $21.12 is ready. Update your payment info. https://docs.example.com/d/k5isac",
+    "Obfuscated phishing (N0rthbank, detai1s) - char n-grams help":
+        "Hello, We noticed activity on your N0rthbank account. C0nfirm your detai1s. https://xcen0-login.info/at5g",
 }
+WORD, CHAR = "Logistic regression", "LR + character n-grams (extension)"
+LRCAL, NB, NBCAL = "LR + sigmoid calibration", "Naive Bayes (uncalibrated)", "NB + sigmoid calibration"
 
 
-@st.cache_resource
+@st.cache_resource(show_spinner="Training models on the synthetic training set…")
 def get_models():
     df = load_data()
     Xtr, Xte, ytr, yte = split(df)
-    models = {
-        "Logistic regression": make_pipeline("lr").fit(Xtr, ytr),
-        "Logistic regression + sigmoid calibration": make_pipeline("lr_cal").fit(Xtr, ytr),
-    }
-    return models, Xte, yte
+    spec = {WORD: ("lr", "word"), CHAR: ("lr", "char_wb"), LRCAL: ("lr_cal", "word"),
+            NB: ("nb", "word"), NBCAL: ("nb_cal", "word")}
+    return {k: make_pipeline(kind, analyzer=an).fit(Xtr, ytr) for k, (kind, an) in spec.items()}, Xte, yte
 
 
 models, Xte, yte = get_models()
-lr = models["Logistic regression"]          # explanation needs the coefficients
+lr = models[WORD]
 
 st.sidebar.header("⚙️ Settings")
 threshold = st.sidebar.slider("Decision threshold", 0.05, 0.95, 0.50, 0.05,
                               help="PHISHING when score >= threshold. Higher = fewer false alarms, more missed phishing.")
 model_name = st.sidebar.selectbox("Classifier", list(models))
 model = models[model_name]
+expl_model = model if model_name in (WORD, CHAR) else lr     # explanations need the coefficients
+st.sidebar.caption("Explanations use the logistic-regression coefficients"
+                   + (" (character n-grams)." if model_name == CHAR else " (word model)."))
 
-choice = st.selectbox("Example messages", ["(write my own)"] + list(EXAMPLES))
-default = EXAMPLES.get(choice, "Northbank: your account has been locked. Verify now http://bit.ly/ab12cd")
-text = st.text_area("Message to classify:", value=default, height=110, key=f"txt-{choice}")
+tab1, tab2, tab3, tab4 = st.tabs(["🔍 Classify", "📊 Calibration", "📁 CSV batch", "📨 SMS Spam test"])
 
+# ============================ TAB 1: classify + feedback ============================
+with tab1:
+    choice = st.selectbox("Example messages", ["(write my own)"] + list(EXAMPLES))
+    default = EXAMPLES.get(choice, "Northbank: your account has been locked. Verify now http://bit.ly/ab12cd")
+    text = st.text_area("Message to classify:", value=default, height=110, key=f"txt-{choice}")
+    if st.button("🔍 Classify", type="primary"):
+        st.session_state["analyzed"] = text
 
-def bars(items, kind):
-    if not items:
-        return '<div class="sub">none</div>'
-    mx = max(abs(v) for _, v in items) or 1
-    out = []
-    for i, (f, v) in enumerate(items):
-        out.append(f'<div class="row" style="animation-delay:{i*0.08:.2f}s"><div class="lab">'
-                   f'<span>{html.escape(f)}</span><span>{v:+.2f}</span></div>'
-                   f'<div class="bar {kind}" style="width:{abs(v)/mx*100:.0f}%;animation-delay:{i*0.08:.2f}s"></div></div>')
-    return "".join(out)
+    def bars(items, kind):
+        if not items:
+            return '<div class="sub">none</div>'
+        mx = max(abs(v) for _, v in items) or 1
+        return "".join(
+            f'<div class="row" style="animation-delay:{i*0.08:.2f}s"><div class="lab"><span>{html.escape(f)}</span>'
+            f'<span>{v:+.2f}</span></div><div class="bar {kind}" style="width:{abs(v)/mx*100:.0f}%;'
+            f'animation-delay:{i*0.08:.2f}s"></div></div>' for i, (f, v) in enumerate(items))
 
+    msg = st.session_state.get("analyzed")
+    if msg:
+        try:
+            _, score = predict(model, msg)
+        except ValueError as err:
+            st.error(str(err)); st.stop()
+        is_phish = score >= threshold                      # live: re-evaluated when the slider moves
+        cls, icon = ("phish", "🚨") if is_phish else ("legit", "✅")
+        st.markdown(
+            f'<div class="res {cls}"><div class="big">{icon} {"Looks like PHISHING-style text" if is_phish else "Looks legit"}</div>'
+            f'<div class="small">score {score:.2f} {"≥" if is_phish else "<"} threshold {threshold:.2f}</div>'
+            f'<div class="gauge"><div class="fill" style="width:{score*100:.0f}%"></div>'
+            f'<div class="thr" style="left:{threshold*100:.0f}%"></div></div></div>', unsafe_allow_html=True)
+        st.markdown('<div class="sub">The score is NOT guaranteed to be a true probability unless calibration was checked '
+                    '(see the Calibration tab).</div>', unsafe_allow_html=True)
 
-if st.button("🔍 Classify", type="primary"):
-    try:
-        _, score = predict(model, text)
-    except ValueError as err:
-        st.error(str(err))
-        st.stop()
+        w = word_weights(lr, msg)
+        parts = []
+        for tok in re.findall(r"\w+|\W+", msg):
+            wt, safe = w.get(tok.lower(), 0.0), html.escape(tok)
+            parts.append(f'<span class="{"up" if wt > 0 else "down"}">{safe}</span>'
+                         if tok.strip() and re.match(r"\w+", tok) and abs(wt) > 0.3 else safe)
+        st.markdown(f'<div class="col-title">Message analysis</div><div class="hl">{"".join(parts)}</div>'
+                    '<div class="sub">red = pushes toward phishing, green = toward legit (strong words only)</div>',
+                    unsafe_allow_html=True)
+        contrib = contributions(expl_model, msg)
+        up = [(f, v) for f, v in contrib.items() if v > 0][:6]
+        down = [(f, v) for f, v in contrib.items() if v < 0][:6]
+        c1, c2 = st.columns(2)
+        c1.markdown(f'<div class="col-title">🔺 Increase the score</div>{bars(up, "p")}', unsafe_allow_html=True)
+        c2.markdown(f'<div class="col-title">🔻 Decrease the score</div>{bars(down, "n")}', unsafe_allow_html=True)
+        st.markdown('<div class="sub">Contribution to the log-odds = TF-IDF value × coefficient. Read the numbers: '
+                    'each column has its own bar scale.</div>', unsafe_allow_html=True)
 
-    is_phish = score >= threshold
-    cls, icon = ("phish", "🚨") if is_phish else ("legit", "✅")
-    title = "Looks like PHISHING-style text" if is_phish else "Looks legit"
-    cmp_ = "≥" if is_phish else "<"
-    st.markdown(
-        f'<div class="res {cls}"><div class="big">{icon} {title}</div>'
-        f'<div class="small">score {score:.2f} {cmp_} threshold {threshold:.2f}</div>'
-        f'<div class="gauge"><div class="fill" style="width:{score*100:.0f}%"></div>'
-        f'<div class="thr" style="left:{threshold*100:.0f}%"></div></div></div>', unsafe_allow_html=True)
-    st.markdown('<div class="sub">The score is NOT guaranteed to be a true probability unless calibration was checked.</div>',
-                unsafe_allow_html=True)
+        # ---- feedback button ----
+        st.divider()
+        if st.button("🚩 Misclassified - log this message for retraining"):
+            row = {"time": datetime.now().isoformat(timespec="seconds"), "text": msg, "score": round(score, 3),
+                   "threshold": threshold, "model": model_name, "predicted": cls,
+                   "suggested_label": "legit" if is_phish else "phish"}
+            st.session_state.setdefault("feedback", []).append(row)
+            try:   # local log (ephemeral on Streamlit Cloud, hence the download below)
+                new = not os.path.exists("feedback.csv")
+                with open("feedback.csv", "a", newline="", encoding="utf-8") as f:
+                    wr = csv.DictWriter(f, fieldnames=list(row)); new and wr.writeheader(); wr.writerow(row)
+            except OSError:
+                pass
+            st.toast("Feedback logged. Thank you!", icon="🚩")
+    fb = st.session_state.get("feedback", [])
+    if fb:
+        st.caption(f"{len(fb)} message(s) flagged this session. Nothing is retrained automatically.")
+        st.download_button("⬇️ Download feedback.csv", pd.DataFrame(fb).to_csv(index=False), "feedback.csv", "text/csv")
 
-    weights = word_weights(lr, text)
-    parts = []
-    for tok in re.findall(r"\w+|\W+", text):
-        w = weights.get(tok.lower(), 0.0)
-        safe = html.escape(tok)
-        if tok.strip() and re.match(r"\w+", tok) and abs(w) > 0.3:
-            parts.append(f'<span class="{"up" if w > 0 else "down"}">{safe}</span>')
+# ============================ TAB 2: calibration ============================
+with tab2:
+    st.write("A **reliability diagram** compares the predicted score with the observed share of phishing. "
+             "The closer to the dotted diagonal, the more the score behaves like a probability. "
+             "Sigmoid (Platt) calibration is fitted with 5-fold cross-validation on the training set.")
+    cal_models = [WORD, LRCAL, NB, NBCAL]
+    fig, ax = plt.subplots(figsize=(5.2, 4.4))
+    fig.patch.set_alpha(0); ax.set_facecolor("#141b38")
+    ax.plot([0, 1], [0, 1], ":", color="white", label="perfect")
+    rows = []
+    for name, col in zip(cal_models, ["#4d9bff", "#00e5a8", "#ff4d6d", "#ffc400"]):
+        p = models[name].predict_proba(Xte)[:, 1]
+        fr, mp = calibration_curve(yte, p, n_bins=8, strategy="quantile")
+        ax.plot(mp, fr, "o-", color=col, label=name)
+        rows.append({"model": name, "Brier score": round(brier_score_loss(yte, p), 3)})
+    ax.set_xlabel("mean predicted score", color="white"); ax.set_ylabel("observed share of phishing", color="white")
+    ax.tick_params(colors="white"); ax.legend(fontsize=7)
+    st.pyplot(fig)
+    st.table(pd.DataFrame(rows).set_index("model"))
+    st.caption("Lower Brier = better probabilities. Naive Bayes is typically over-confident; calibration improves it.")
+
+# ============================ TAB 3: CSV batch ============================
+with tab3:
+    st.write("Upload a CSV with a **text** column (or the first column is used). Messages with score ≥ threshold "
+             f"(**{threshold:.2f}**, current model) are flagged. Nothing is blocked or deleted.")
+    up = st.file_uploader("CSV of messages", type=["csv"], key="batch")
+    if up:
+        d = pd.read_csv(up).head(5000)
+        col = "text" if "text" in d.columns else d.columns[0]
+        d["score"] = model.predict_proba(d[col].fillna("").astype(str))[:, 1].round(3)
+        d["flag"] = np.where(d["score"] >= threshold, "phish", "legit")
+        flagged = d[d["flag"] == "phish"]
+        st.write(f"{len(flagged)} flagged out of {len(d)} messages (max 5,000 rows).")
+        st.dataframe(flagged, use_container_width=True)
+        st.download_button("⬇️ Export flagged messages (CSV)", flagged.to_csv(index=False), "flagged.csv", "text/csv")
+
+# ============================ TAB 4: UCI SMS Spam ============================
+with tab4:
+    st.warning("The UCI SMS Spam collection is a **spam** dataset, not a phishing dataset, and the models here were "
+               "trained on synthetic messages: low scores are expected (domain shift).")
+    st.write("Upload `SMSSpamCollection` (tab-separated: label, text) from the UCI repository, or the Kaggle CSV "
+             "(columns v1, v2). The current model and threshold are applied to it.")
+    up2 = st.file_uploader("SMS Spam Collection", type=["txt", "csv", "tsv", ""], key="sms")
+    if up2:
+        raw = up2.getvalue().decode("latin-1")
+        if "\t" in raw.splitlines()[0]:
+            s = pd.read_csv(io.StringIO(raw), sep="\t", header=None, names=["label", "text"], quoting=csv.QUOTE_NONE)
         else:
-            parts.append(safe)
-    st.markdown(f'<div class="col-title">Message analysis</div><div class="hl">{"".join(parts)}</div>'
-                '<div class="sub">red = pushes toward phishing, green = pushes toward legit (strong words only)</div>',
-                unsafe_allow_html=True)
-
-    contrib = contributions(lr, text)
-    up = [(f, v) for f, v in contrib.items() if v > 0][:6]
-    down = [(f, v) for f, v in contrib.items() if v < 0][:6]
-    c1, c2 = st.columns(2)
-    c1.markdown(f'<div class="col-title">🔺 Increase the score</div>{bars(up, "p")}', unsafe_allow_html=True)
-    c2.markdown(f'<div class="col-title">🔻 Decrease the score</div>{bars(down, "n")}', unsafe_allow_html=True)
-    st.markdown('<div class="sub">Contribution to the log-odds = TF-IDF value × logistic-regression coefficient.</div>',
-                unsafe_allow_html=True)
+            s = pd.read_csv(io.StringIO(raw)).iloc[:, :2]; s.columns = ["label", "text"]
+        s = s[s["label"].isin(["ham", "spam"])].dropna()
+        y = (s["label"] == "spam").astype(int).values
+        pred = (model.predict_proba(s["text"].astype(str))[:, 1] >= threshold).astype(int)
+        p_, r_, f_, _ = precision_recall_fscore_support(y, pred, average="binary", zero_division=0)
+        st.write(f"{len(s)} messages, {y.mean():.1%} spam. Precision **{p_:.3f}**, recall **{r_:.3f}**, F1 **{f_:.3f}**")
+        cm = confusion_matrix(y, pred, labels=[0, 1])
+        st.table(pd.DataFrame(cm, index=["true ham", "true spam"], columns=["pred legit", "pred phish"]))
 
 with st.expander("📈 Precision / recall versus threshold (test set)"):
     scores = model.predict_proba(Xte)[:, 1]
     rows = []
     for t in np.arange(0.1, 0.95, 0.05):
-        pred = scores >= t
-        tp = int(((pred == 1) & (yte.values == 1)).sum())
-        rows.append({"threshold": round(t, 2),
-                     "precision": tp / pred.sum() if pred.sum() else float("nan"),
+        pr = scores >= t; tp = int(((pr == 1) & (yte.values == 1)).sum())
+        rows.append({"threshold": round(t, 2), "precision": tp / pr.sum() if pr.sum() else float("nan"),
                      "recall": tp / (yte.values == 1).sum()})
     st.line_chart(pd.DataFrame(rows).set_index("threshold"))
